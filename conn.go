@@ -26,6 +26,12 @@ const (
 	minMTUSize    = 400
 	maxMTUSize    = 1492
 	maxWindowSize = 2048
+
+	ackFlushInterval       = time.Second / 100
+	ackImmediateThreshold  = 64
+	retransmissionInterval = time.Second * 3 / 10
+	keepAliveInterval      = time.Second / 2
+	closeCheckInterval     = time.Second / 10
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -33,11 +39,20 @@ const (
 // RakNet. Methods may be called on Conn from multiple goroutines
 // simultaneously.
 type Conn struct {
-	// rtt is the last measured round-trip time between both ends of the
-	// connection. The rtt is measured in nanoseconds.
+	// rtt is the ACK-derived round-trip time used for retransmission. The rtt
+	// is measured in nanoseconds.
 	rtt atomic.Int64
+	// pingRTT is the most recent ConnectedPing/ConnectedPong round-trip time.
+	// It is kept separate from rtt so ACK scheduling cannot distort the
+	// user-facing latency measurement.
+	pingRTT      atomic.Int64
+	pingMeasured atomic.Bool
+	pingMu       sync.Mutex
+	pingTime     int64
+	pingPending  bool
 
-	closing atomic.Int64
+	closing   atomic.Int64
+	closeWake chan struct{}
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -75,10 +90,10 @@ type Conn struct {
 	win *datagramWindow
 
 	ackMu sync.Mutex
-	// ackSlice is a slice containing sequence numbers of datagrams that were
-	// received over the last second. When ticked, all of these packets are sent
-	// in an ACK and the slice is cleared.
-	ackSlice []uint24
+	// ackSlice contains sequence numbers waiting to be acknowledged.
+	ackSlice     []uint24
+	ackScheduled bool
+	ackWake      chan struct{}
 
 	// packetQueue is an ordered queue containing packets indexed by their order
 	// index.
@@ -113,6 +128,8 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
+		ackWake:        make(chan struct{}, 1),
+		closeWake:      make(chan struct{}, 1),
 	}
 	c.ctx, c.cancelFunc = context.WithCancel(context.Background())
 	t := time.Now()
@@ -135,53 +152,132 @@ func (conn *Conn) effectiveMTU() uint16 {
 	return conn.mtu - 28
 }
 
-// startTicking makes the connection start ticking, sending ACKs and pings to
-// the other end where necessary and checking if the connection should be timed
-// out.
+// startTicking schedules ACKs independently from retransmission, keepalive and
+// close maintenance. ACKs are only scheduled while some are pending, without
+// introducing a 100 Hz idle ticker per connection.
 func (conn *Conn) startTicking() {
+	retransmissionTicker := time.NewTicker(retransmissionInterval)
+	keepAliveTicker := time.NewTicker(keepAliveInterval)
+	ackTimer := time.NewTimer(ackFlushInterval)
+	if !ackTimer.Stop() {
+		<-ackTimer.C
+	}
 	var (
-		interval = time.Second / 10
-		ticker   = time.NewTicker(interval)
-		i        int64
-		acksLeft int
+		ackTimerC    <-chan time.Time
+		closeTicker  *time.Ticker
+		closeTickerC <-chan time.Time
+		acksLeft     int
 	)
-	defer ticker.Stop()
+	defer retransmissionTicker.Stop()
+	defer keepAliveTicker.Stop()
+	defer ackTimer.Stop()
+	defer func() {
+		if closeTicker != nil {
+			closeTicker.Stop()
+		}
+	}()
+
+	stopACKTimer := func() {
+		if ackTimerC == nil {
+			return
+		}
+		if !ackTimer.Stop() {
+			select {
+			case <-ackTimer.C:
+			default:
+			}
+		}
+		ackTimerC = nil
+	}
 	for {
 		select {
-		case t := <-ticker.C:
-			i++
-			conn.flushACKs()
-			if i%3 == 0 {
-				conn.checkResend(t)
+		case <-conn.ackWake:
+			pending := conn.pendingACKs()
+			if pending >= ackImmediateThreshold {
+				stopACKTimer()
+				conn.flushACKs()
+			} else if ackTimerC == nil && pending != 0 {
+				ackTimer.Reset(ackFlushInterval)
+				ackTimerC = ackTimer.C
 			}
-			if unix := conn.closing.Load(); unix != 0 {
-				before := acksLeft
-				conn.mu.Lock()
-				acksLeft = len(conn.retransmission.unacknowledged)
-				conn.mu.Unlock()
-
-				if before != 0 && acksLeft == 0 {
-					conn.closeImmediately()
-				}
-				since := t.Sub(time.Unix(unix, 0))
-				if (acksLeft == 0 && since > time.Second) || since > time.Second*5 {
-					conn.closeImmediately()
-				}
+		case <-ackTimerC:
+			ackTimerC = nil
+			conn.flushACKs()
+		case t := <-retransmissionTicker.C:
+			conn.checkResend(t)
+		case t := <-keepAliveTicker.C:
+			if conn.closing.Load() != 0 {
 				continue
 			}
-			if i%5 == 0 {
-				// Ping the other end periodically to prevent timeouts.
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+			// Ping the other end periodically to prevent timeouts and measure
+			// latency independently from ACK scheduling.
+			_ = conn.sendLatencyPing()
 
-				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
-					// No activity for too long: Start timeout.
-					_ = conn.Close()
-				}
-				conn.mu.Unlock()
+			conn.mu.Lock()
+			timedOut := t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2
+			conn.mu.Unlock()
+			if timedOut {
+				_ = conn.Close()
 			}
+		case <-conn.closeWake:
+			if closeTicker == nil {
+				closeTicker = time.NewTicker(closeCheckInterval)
+				closeTickerC = closeTicker.C
+			}
+			conn.checkClose(time.Now(), &acksLeft)
+		case t := <-closeTickerC:
+			conn.checkClose(t, &acksLeft)
 		case <-conn.ctx.Done():
 			return
+		}
+	}
+}
+
+// checkClose finishes a graceful close after all reliable packets are
+// acknowledged, or once its deadline is reached.
+func (conn *Conn) checkClose(now time.Time, acksLeft *int) {
+	unix := conn.closing.Load()
+	if unix == 0 {
+		return
+	}
+	before := *acksLeft
+	conn.mu.Lock()
+	*acksLeft = len(conn.retransmission.unacknowledged)
+	conn.mu.Unlock()
+	if before != 0 && *acksLeft == 0 {
+		conn.closeImmediately()
+		return
+	}
+	since := now.Sub(time.Unix(unix, 0))
+	if (*acksLeft == 0 && since > time.Second) || since > time.Second*5 {
+		conn.closeImmediately()
+	}
+}
+
+// pendingACKs returns the number of datagrams waiting to be acknowledged.
+func (conn *Conn) pendingACKs() int {
+	conn.ackMu.Lock()
+	defer conn.ackMu.Unlock()
+	return len(conn.ackSlice)
+}
+
+// queueACK records a received datagram and wakes the ACK scheduler when the
+// first entry or the immediate-flush threshold is reached.
+func (conn *Conn) queueACK(seq uint24) {
+	conn.ackMu.Lock()
+	conn.ackSlice = append(conn.ackSlice, seq)
+	wake := false
+	if !conn.ackScheduled {
+		conn.ackScheduled = true
+		wake = true
+	} else if len(conn.ackSlice) == ackImmediateThreshold {
+		wake = true
+	}
+	conn.ackMu.Unlock()
+	if wake {
+		select {
+		case conn.ackWake <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -190,6 +286,7 @@ func (conn *Conn) startTicking() {
 func (conn *Conn) flushACKs() {
 	conn.ackMu.Lock()
 	defer conn.ackMu.Unlock()
+	defer func() { conn.ackScheduled = false }()
 
 	if len(conn.ackSlice) > 0 {
 		// Write an ACK packet to the connection containing all datagram
@@ -327,7 +424,12 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 // cancelled and will return an error, as soon as the closing of the connection
 // is acknowledged by the client.
 func (conn *Conn) Close() error {
-	conn.closing.CompareAndSwap(0, time.Now().Unix())
+	if conn.closing.CompareAndSwap(0, time.Now().Unix()) {
+		select {
+		case conn.closeWake <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -378,11 +480,32 @@ func (conn *Conn) SetWriteDeadline(time.Time) error { return ErrNotSupported }
 // SetDeadline is unimplemented. It always returns ErrNotSupported.
 func (conn *Conn) SetDeadline(time.Time) error { return ErrNotSupported }
 
-// Latency returns a rolling average of rtt between the sending and the
-// receiving end of the connection. The rtt returned is updated continuously
-// and is half the average round trip time (RTT).
+// Latency returns half the most recent ConnectedPing/ConnectedPong round-trip
+// time. Before the first pong arrives, it falls back to the ACK-derived RTT.
 func (conn *Conn) Latency() time.Duration {
+	if conn.pingMeasured.Load() {
+		return time.Duration(conn.pingRTT.Load() / 2)
+	}
 	return time.Duration(conn.rtt.Load() / 2)
+}
+
+// sendLatencyPing sends a connected ping and records its timestamp so only
+// the matching pong may update the user-facing latency measurement.
+func (conn *Conn) sendLatencyPing() error {
+	pingTime := timestamp()
+	conn.pingMu.Lock()
+	conn.pingTime = pingTime
+	conn.pingPending = true
+	conn.pingMu.Unlock()
+	if err := conn.sendUnreliable(&message.ConnectedPing{PingTime: pingTime}); err != nil {
+		conn.pingMu.Lock()
+		if conn.pingTime == pingTime {
+			conn.pingPending = false
+		}
+		conn.pingMu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // send encodes an encoding.BinaryMarshaler and writes it to the Conn.
@@ -435,11 +558,7 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		// to return an error.
 		return nil
 	}
-	conn.ackMu.Lock()
-	// Add this sequence number to the received datagrams, so that it is
-	// included in an ACK.
-	conn.ackSlice = append(conn.ackSlice, seq)
-	conn.ackMu.Unlock()
+	conn.queueACK(seq)
 
 	if conn.win.shift() == 0 {
 		// Datagram window couldn't be shifted up, so we're still missing
